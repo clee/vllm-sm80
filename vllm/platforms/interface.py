@@ -957,9 +957,62 @@ class Platform:
 
         # Use minimum block size that satisfies both backend alignment and
         # mamba page size compatibility
+        # [local patch] UNIT FIX (comparison only): attn_page_size_1_token is
+        # ONE attention layer's page size, but mamba_page_size aggregates ALL
+        # recurrent layers' state. Upstream's cdiv compared them directly,
+        # over-counting by the attention layer count (~12x here) and
+        # spuriously doubling block_size (1632->3264) whenever the aggregate
+        # exceeded one layer's page — e.g. fp8 KV, where the per-layer page
+        # halves first. Scale the attention side for the comparison ONLY;
+        # attn_page_size_1_token itself stays per-layer because the
+        # mamba_page_size_padded computation below compares against a single
+        # page and must not absorb the layer factor.
+        layer_types_value = getattr(model_config.hf_text_config, "layer_types", None)
+        if layer_types_value:
+            start, end = model_config.get_layers_start_end_indices(parallel_config)
+            attn_types = {
+                "full_attention",
+                "qwen_sparse_attention",
+                "sliding_attention",
+            }
+            attn_layers = max(
+                1,
+                sum(1 for t in layer_types_value[start:end] if t in attn_types),
+            )
+        else:
+            attn_layers = 1
         attn_block_size = kernel_block_alignment_size * cdiv(
             mamba_page_size,
-            kernel_block_alignment_size * attn_page_size_1_token,
+            kernel_block_alignment_size * attn_page_size_1_token * attn_layers,
+        )
+        logger.info(
+            "[local] hybrid align comparison: mamba=%d B, attn group page/"
+            "token=%d B (%d layers x %d B), cdiv->%d",
+            mamba_page_size,
+            attn_page_size_1_token * attn_layers,
+            attn_layers,
+            attn_page_size_1_token,
+            cdiv(
+                mamba_page_size,
+                kernel_block_alignment_size
+                * attn_page_size_1_token
+                * attn_layers,
+            ),
+        )
+        # [local patch] diagnostic: expose the real sizing inputs
+        logger.info(
+            "[diag] hybrid align: mamba_page_size=%d bytes (%.2f MiB), "
+            "attn_page_1_token=%d bytes, kernel_block_alignment_size=%d, "
+            "cdiv result=%d, user block_size=%d",
+            mamba_page_size,
+            mamba_page_size / 2**20,
+            attn_page_size_1_token,
+            kernel_block_alignment_size,
+            cdiv(
+                mamba_page_size,
+                kernel_block_alignment_size * attn_page_size_1_token,
+            ),
+            cache_config.block_size,
         )
         indexer_align = cls._get_indexer_block_alignment(vllm_config)
         if indexer_align:
@@ -975,10 +1028,18 @@ class Platform:
 
         if cache_config.mamba_cache_mode == "align":
             cache_config.mamba_block_size = cache_config.block_size
+        # [local patch] unit-fix end
 
         # Pad mamba page size to exactly match attention page size
         attn_page_size = cache_config.block_size * attn_page_size_1_token
-        assert attn_page_size >= mamba_page_size
+        # [local patch] UNIT FIX: the assert must compare the aggregate
+        # attention page (per-layer page x attn layer count) against the
+        # all-layers mamba page — the bare per-layer comparison fails under
+        # fp8 KV. The PADDING target stays the per-layer attention page
+        # (upstream semantics): mamba state only needs to fit within one
+        # attention page slot; padding to the aggregate would 4x the state
+        # and consume the entire fp8 KV dividend.
+        assert attn_page_size * attn_layers >= mamba_page_size
 
         if attn_page_size == mamba_page_size:
             return
