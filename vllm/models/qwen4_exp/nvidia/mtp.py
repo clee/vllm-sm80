@@ -284,7 +284,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hidden_size = self.hidden_size
         prev_block_output: torch.Tensor | None = None
 
-        if get_pp_group().is_first_rank:
+        # [local patch] The speculator invokes the draft directly on the last
+        # PP rank with intermediate_tensors=None (draft is pp_size=1, whole).
+        # Run the full first-rank path on that direct call.
+        if get_pp_group().is_first_rank or intermediate_tensors is None:
             assert hidden_states is not None
             if inputs_embeds is None:
                 assert input_ids is not None

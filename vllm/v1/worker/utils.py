@@ -429,6 +429,14 @@ def allocate_kv_cache(
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
         layer_name = tensor.layers[0]
+        # [local patch] Cross-PP merged kv_cache_tensors can name layers this
+        # rank does not own (e.g. layers.1.ple on PP>0). Skip them instead of
+        # dying in the group lookup below — the owning rank allocates them.
+        if not any(
+            layer_name in group.layer_names
+            for group in kv_cache_config.kv_cache_groups
+        ):
+            continue
         group_id, group = next(
             (group_id, group)
             for group_id, group in enumerate(kv_cache_config.kv_cache_groups)

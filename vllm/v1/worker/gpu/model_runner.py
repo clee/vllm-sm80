@@ -32,7 +32,7 @@ import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.compilation.wrapper import compile_model_with_stock_torch
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
@@ -370,37 +370,42 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.load_config.load_format = "dummy"
         self.eplb.prepare_load()
         eplb_models_added = False
-        with DeviceMemoryProfiler() as m:
-            model_loader = get_model_loader(self.vllm_config.load_config)
-            logger.info_once("Loading model from scratch...")
+        # [local patch] Model constructors read get_current_vllm_config()
+        # (e.g. Qwen4Exp PLE picks PinnedHost vs Device embedding from
+        # engram_config.cpu_offload). Without this context the workers default
+        # to the device-resident class and allocate the 96 GiB table on GPU.
+        with set_current_vllm_config(self.vllm_config):
+            with DeviceMemoryProfiler() as m:
+                model_loader = get_model_loader(self.vllm_config.load_config)
+                logger.info_once("Loading model from scratch...")
 
-            # Capture warmup providers selected while constructing the model.
-            with self.jit_warmup_registry.activate():
-                self.model = model_loader.load_model(
-                    vllm_config=self.vllm_config,
-                    model_config=self.vllm_config.model_config,
-                )
-            if self.lora_config:
-                self.model = self.load_lora_model(
-                    self.model, self.vllm_config, self.device
-                )
+                # Capture warmup providers selected while constructing the model.
+                with self.jit_warmup_registry.activate():
+                    self.model = model_loader.load_model(
+                        vllm_config=self.vllm_config,
+                        model_config=self.vllm_config.model_config,
+                    )
+                if self.lora_config:
+                    self.model = self.load_lora_model(
+                        self.model, self.vllm_config, self.device
+                    )
 
-            if self.use_aux_hidden_state_outputs:
-                assert self.speculative_config is not None
-                set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
-                if self.use_pp:
-                    assert self.speculative_config.method is not None
-                    verify_supports_aux_hidden_states_over_pp(
-                        self.model, self.speculative_config.method
-                    )
-                    assert self.pp_handler is not None
-                    self.pp_handler.configure_aux_hidden_state_relay(self.model)
-            if isinstance(self.speculator, DraftModelSpeculator):
-                with use_workspace_lane(self._draft_workspace_lane):
-                    self.speculator.load_model(self.model)
-                    eplb_models_added = self.eplb.maybe_register_speculator(
-                        self.speculator, self.speculative_config, load_dummy_weights
-                    )
+                if self.use_aux_hidden_state_outputs:
+                    assert self.speculative_config is not None
+                    set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
+                    if self.use_pp:
+                        assert self.speculative_config.method is not None
+                        verify_supports_aux_hidden_states_over_pp(
+                            self.model, self.speculative_config.method
+                        )
+                        assert self.pp_handler is not None
+                        self.pp_handler.configure_aux_hidden_state_relay(self.model)
+                if isinstance(self.speculator, DraftModelSpeculator):
+                    with use_workspace_lane(self._draft_workspace_lane):
+                        self.speculator.load_model(self.model)
+                        eplb_models_added = self.eplb.maybe_register_speculator(
+                            self.speculator, self.speculative_config, load_dummy_weights
+                        )
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory

@@ -1392,6 +1392,18 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config,
                         self.target_model_config.max_model_len,
                     )
+                # [local patch] Inline MTP drafts share the target's
+                # positional space exactly like EAGLE drafts, but compose_
+                # draft_hf_overrides drops the target's *dict* hf_overrides
+                # (the YaRN raise for --max-model-len beyond the checkpoint's
+                # max_position_embeddings). Without this the draft derives
+                # max_model_len from the raw 262144 and its rotary cache
+                # extrapolates past the trained range.
+                if self.method == "mtp" and self.draft_model_config is not None:
+                    SpeculativeConfig._maybe_override_draft_max_position_embeddings(
+                        self.draft_model_config.hf_config,
+                        self.target_model_config.max_model_len,
+                    )
 
                 # Replace hf_config for EAGLE draft_model
                 if self.method in ("eagle", "eagle3", "dflash"):
