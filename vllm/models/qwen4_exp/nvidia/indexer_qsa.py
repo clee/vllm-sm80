@@ -306,7 +306,9 @@ class QSAIndexer(nn.Module):
             )
             main_kv_cache = attn.kv_cache.transpose(1, 2)
             if attn.kv_cache_dtype in ("fp8", "fp8_e4m3"):
-                main_kv_cache = main_kv_cache.view(torch.float8_e4m3fn)
+                # [local patch] sm80: hand the fused prepare a uint8 view; the
+                # kernel software-encodes e4m3 (no native fp8e4nv on sm80).
+                main_kv_cache = main_kv_cache.view(torch.uint8)
             main_outputs = qsa_prepare(
                 projected_q,
                 raw_keys,

@@ -81,12 +81,63 @@ def _norm_rope(
 
 
 @triton.jit
+def _encode_e4m3fn_u8(x):
+    """Software RNE e4m3 encode for sm80 (no native float8e4nv in Triton).
+
+    Bit-level round-to-nearest-even on the fp32 bits (validated bit-exact
+    against torch.float8_e4m3fn offline): clamp to ±448, then either pack a
+    subnormal (|v| < 2^-6, 512-scaled RNE) or extract exponent + top-3
+    mantissa with a 20-bit remainder RNE, handling the mantissa carry into
+    the exponent and saturation.
+    """
+    y = tl.minimum(tl.maximum(x, -448.0), 448.0)
+    b = y.to(tl.uint32, bitcast=True)
+    sign = (b >> 24) & 0x80
+    abits = b & 0x7FFFFFFF
+    SUBNORM_CUTOFF: tl.constexpr = 0x3C800000  # 2**-6
+
+    # subnormal branch
+    t = tl.abs(y) * 512.0
+    i = t.to(tl.int32)  # floor for non-negative
+    frac = t - i.to(tl.float32)
+    half: tl.constexpr = 0.5
+    q = i + tl.where(frac > half, 1, tl.where(frac == half, i & 1, 0))
+    q = tl.minimum(q, 8)
+    sub = sign | q.to(tl.uint8)
+
+    # normal branch
+    e = (abits >> 23).to(tl.int32) - 120
+    m3 = (abits & 0x7FFFFF) >> 20
+    rem = abits & 0xFFFFF
+    round_up = (rem > 0x80000) | ((rem == 0x80000) & ((m3 & 1) == 1))
+    m = tl.where(round_up, m3 + 1, m3)
+    carried = m == 8
+    e = tl.where(carried, e + 1, e)
+    m = tl.where(carried, 0, m)
+    sat = e > 15
+    norm = tl.where(sat, (e * 0 + 0x7E), ((e << 3) | m))
+    nb = sign | norm.to(tl.uint32)
+
+    out = tl.where(abits < SUBNORM_CUTOFF, sub.to(tl.uint32), nb)
+    return out.to(tl.uint8)
+
+
+@triton.jit
 def _to_dst_dtype(x, dst, scale):
-    """Round to BF16 like the unfused path, then scale for an FP8 destination."""
+    """Round to BF16 like the unfused path, then scale for an FP8 destination.
+
+    [local patch] sm80: the fp8 destination arrives as a uint8 view (no
+    native e4m3 in Triton on this arch), so encode in software instead of
+    converting to tl.float8e4nv.
+    """
     out_ty = dst.dtype.element_ty
     x = x.to(tl.bfloat16)
     if out_ty == tl.float8e4nv:
         x = x.to(tl.float32) / scale
+        return _encode_e4m3fn_u8(x)
+    if out_ty == tl.uint8:
+        x = x.to(tl.float32) / scale
+        return _encode_e4m3fn_u8(x)
     return x.to(out_ty)
 
 
