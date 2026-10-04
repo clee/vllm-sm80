@@ -4,14 +4,20 @@
 
 from typing import Any
 
+import os as _os
+
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
+
+logger = init_logger(__name__)
 
 
 class Qwen4ExpModelState(MambaHybridModelState):
@@ -26,19 +32,16 @@ class Qwen4ExpModelState(MambaHybridModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
-        self.uses_ngram_embedding = bool(config.ple_layer_ids)
+        self.uses_ngram_embedding = (
+            bool(config.ple_layer_ids) and get_pp_group().is_first_rank
+        )
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
             self.ngram_eos_token_id = 0
             return
 
-        if vllm_config.parallel_config.pipeline_parallel_size > 1:
-            raise RuntimeError(
-                "N-gram PLE embedding currently requires "
-                "pipeline_parallel_size=1 because non-first pipeline ranks do "
-                "not receive the raw input_ids required by PLE. Please run "
-                "with PP=1."
-            )
+        # [local patch] PLE lives on the first PP rank only (see gating
+        # above); the PP=1 requirement applies only to ranks that run PLE.
 
         self.ngram_context_len = int(config.ngram_size) - 1
         if self.ngram_context_len <= 0:
@@ -63,6 +66,39 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        # src302/tonyd2wild staged gather: VLLM_PLE_STAGED=1 gathers PLE rows
+        # from the preadv table on the host in prepare_inputs, into a fixed
+        # GPU staging buffer the forward reads by views only.
+        self._staged_ple: list = []
+        self._ple_table = None
+        if _os.environ.get("VLLM_PLE_STAGED", "0") == "1":
+            from .ngram_embedding import Qwen4ExpNGramEmbedding
+            from .ple_preadv import PLEPreadvTable
+
+            model_dir = _os.environ.get(
+                "QWEN4EXP_PLE_MODEL_DIR",
+                _os.environ.get("VLLM_PLE_MMAP_DIR", "/models").rsplit(
+                    "/.ple-mmap", 1
+                )[0],
+            )
+            # ple_layer_ids are absolute ids (layer_idx + 1); PLE shards are
+            # named for the decoder layer index below.
+            ple_layer_idxs = sorted(int(i) - 1 for i in config.ple_layer_ids)
+            for m in model.modules():
+                if isinstance(m, Qwen4ExpNGramEmbedding):
+                    emb = m.ngram_embedding
+                    if self._ple_table is None:
+                        self._ple_table = PLEPreadvTable(
+                            model_dir, ple_layer_idxs[0]
+                        )
+                        if int(emb.org_vocab_size) != self._ple_table.rows_total:
+                            raise ValueError(
+                                f"staged PLE table rows {self._ple_table.rows_total} "
+                                f"!= vocab {emb.org_vocab_size}"
+                            )
+                        logger.info("staged PLE table: %s", self._ple_table.describe())
+                    m._ple_init_staging(self.max_num_tokens, self.device)
+                    self._staged_ple.append(m)
 
     def _prepare_ngram_context(
         self,
@@ -106,10 +142,24 @@ class Qwen4ExpModelState(MambaHybridModelState):
         query_start_loc[: num_reqs_padded + 1].copy_(input_batch.query_start_loc)
         # Represent unused capacity as trailing zero-length requests.
         query_start_loc[num_reqs_padded + 1 :].copy_(input_batch.query_start_loc[-1])
+        ngram_context = self._prepare_ngram_context(input_batch, req_states)
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
+        if self._staged_ple:
+            num_tokens = int(input_batch.num_tokens)
+            padded = int(input_batch.num_tokens_after_padding)
+            num_reqs = int(input_batch.num_reqs)
+            for m in self._staged_ple:
+                m._ple_stage_rows(
+                    input_batch.input_ids,
+                    query_start_loc[: num_reqs + 1],
+                    ngram_context[:num_reqs],
+                    num_tokens,
+                    padded,
+                    self._ple_table,
+                )
         return model_inputs
 
     def prepare_dummy_inputs(
@@ -141,6 +191,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
+        for m in self._staged_ple:
+            m._ple_stage_zero(num_tokens)  # capture-time: no host reads here
         return model_inputs
 
 

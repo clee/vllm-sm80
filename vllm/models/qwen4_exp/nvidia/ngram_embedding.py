@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -355,11 +356,84 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
+        staging = getattr(self, "_ple_staged_buffer", None)
+        if staging is not None:
+            # Staged mode: rows were gathered on the host in prepare_inputs,
+            # before the forward or graph replay. Only views here: graph-safe.
+            # Layout: ngram_heads rows per token, token-major.
+            n = input_ids.reshape(-1).shape[0]
+            h = self.ngram_heads
+            out = staging[: n * h].view(self._ple_staged_dtype).view(
+                n, h * self.head_dim
+            )
+            if os.environ.get("VLLM_PLE_DEBUG", "0") == "1":
+                from ..common.ngram_embedding import _ple_log
+                _ple_log("fwd-read", out.detach().cpu())
+            return out
         embedding = self.ngram_embedding
         if embedding.supports_prefetch:
             return embedding(hidden_states)
         ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
         return self.ngram_embedding(ngram_ids).flatten(-2)
+
+    # --- src302/tonyd2wild: staged gather (host side, before the forward) ---
+    def _ple_init_staging(self, max_num_tokens: int, device: torch.device) -> None:
+        rows = int(max_num_tokens) * int(self.ngram_heads)
+        self._ple_staged_buffer = torch.zeros(
+            (rows, self.head_dim * 2),
+            dtype=torch.uint8,
+            device=device,
+        )
+        self._ple_staged_dtype = torch.bfloat16
+        logger.info(
+            "PLE staged gather: staging %d tokens x %d heads = %d rows on %s",
+            int(max_num_tokens), int(self.ngram_heads), rows, device,
+        )
+
+    def _ple_stage_zero(self, num_tokens: int) -> None:
+        self._ple_staged_buffer[: max(int(num_tokens), 0) * self.ngram_heads].zero_()
+
+    def _ple_stage_rows(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
+        num_tokens: int,
+        padded_tokens: int,
+        table,
+    ) -> None:
+        if num_tokens <= 0:
+            self._ple_stage_zero(padded_tokens)
+            return
+        # prepare_dummy_inputs (cudagraph capture warmup, profiling) feeds
+        # zero/placeholder ids; gathering table rows for them is wasted I/O.
+        # Zero the staging instead: capture-time consumers never need real PLE.
+        if int(input_ids[:num_tokens].abs().sum()) == 0:
+            self._ple_stage_zero(padded_tokens)
+            return
+        ids = self.compute_ngram_ids(input_ids[:num_tokens], query_start_loc, ngram_context)
+        # [debug] match the non-staged _lookup tags for cross-mode comparison.
+        _dbg = os.environ.get("VLLM_PLE_DEBUG", "0") == "1"
+        if _dbg:
+            from ..common.ngram_embedding import _ple_log
+            with open(os.environ.get("VLLM_PLE_DEBUG_LOG", "/tmp/ple_debug.log"), "a") as _f:
+                _f.write(f"stage-geom n={num_tokens} padded={padded_tokens} "
+                         f"qsl={query_start_loc.numel()} ids={tuple(ids.shape)}\n")
+            _ple_log("lookup-in", ids.detach().cpu())
+        ids_cpu = ids.detach().reshape(-1).to("cpu", dtype=torch.int64)
+        rows = table.gather_cpu(ids_cpu)
+        if _dbg:
+            _ple_log("lookup-rows", ids_cpu, rows.view(-1, self.head_dim).view(torch.bfloat16).view(-1, 16, self.head_dim))
+        staging = self._ple_staged_buffer
+        staging[: num_tokens * self.ngram_heads].view(torch.uint8).copy_(
+            rows, non_blocking=True
+        )
+        # [debug] VLLM_PLE_SYNC=1 forces a post-H2D sync (original behavior)
+        # to isolate whether the corruption is a staging race.
+        if os.environ.get("VLLM_PLE_SYNC", "0") == "1":
+            torch.cuda.current_stream().synchronize()
+        if padded_tokens > num_tokens:
+            staging[num_tokens * self.ngram_heads : padded_tokens * self.ngram_heads].zero_()
 
     def start_prefetch(
         self,
@@ -369,6 +443,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ngram_context: torch.Tensor,
     ) -> None:
         """Start the pinned lookup while the preceding decoder layer runs."""
+        if getattr(self, "_ple_staged_buffer", None) is not None:
+            return  # staged mode: rows already gathered in prepare_inputs
         embedding = self.ngram_embedding
         if not embedding.supports_prefetch:
             return
@@ -432,6 +508,14 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                         f"expected {expected_shape}, got "
                         f"{tuple(loaded_weight.shape)}"
                     )
+                import os as _os
+
+                if _os.environ.get("VLLM_PLE_STAGED", "0") == "1":
+                    # Staged mode reads rows from the checkpoint shards via
+                    # the preadv table; writing them through would touch the
+                    # full 96 GiB placeholder. Validate only.
+                    loaded.add("ngram_embedding.weight")
+                    continue
                 embedding.weight.weight_loader(
                     embedding.weight,
                     loaded_weight,
@@ -449,3 +533,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 __all__ = [
     "Qwen4ExpNGramEmbedding",
 ]
+
+
+# --- src302: VLLM_PLE_MMAP=1 serves the n-gram table from NVMe page cache.
+# Reuses bp/mmap_swap.py's cache (same geometry key), adapted to this class
+# layout. Installed here because load_weights is defined on this class in the
+# 0.30.1rc1.dev558 tree.
+if os.environ.get("VLLM_PLE_MMAP") == "1":
+    from vllm.v1.ple_offload.mmap_swap import apply as _ple_mmap_apply
+
+    _ple_mmap_apply(Qwen4ExpNGramEmbedding)

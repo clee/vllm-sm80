@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     CompressedTensorsConfig,
 )
+from vllm.model_executor.layers.quantization.inc.inc import INCConfig
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
@@ -49,6 +50,34 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from .ple import PLEVocabParallelEmbedding
 
 logger = init_logger(__name__)
+
+
+# [local patch] PLE gather runtime instrumentation (VLLM_PLE_DEBUG=1).
+import hashlib as _hashlib
+import os as _os
+import threading as _threading
+
+_ple_dbg_lock = _threading.Lock()
+
+
+def _ple_debug() -> bool:
+    return _os.environ.get("VLLM_PLE_DEBUG", "0") == "1"
+
+
+def _ple_log(tag: str, *tensors) -> None:
+    h = _hashlib.sha256()
+    parts = [tag]
+    for t in tensors:
+        t = t.detach().contiguous().cpu()
+        if t.dtype == torch.bfloat16:
+            t = t.view(torch.uint16)
+        b = t.numpy().tobytes()
+        h.update(b)
+        parts.append(f"{tuple(t.shape)}")
+    with _ple_dbg_lock, open(
+        _os.environ.get("VLLM_PLE_DEBUG_LOG", "/tmp/ple_debug.log"), "a"
+    ) as f:
+        f.write(f"{parts[0]} {h.hexdigest()[:16]} {' '.join(parts[1:])}\n")
 
 
 class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
@@ -189,6 +218,14 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
             isinstance(quant_config, CompressedTensorsConfig)
             and quant_config.get_scheme_dict(None, layer_name=prefix) is None
         ):
+            return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+        # [local patch] AutoRound/intel-neural-compressor checkpoints quantize
+        # only the routed experts; the PLE table ships BF16 with no per-layer
+        # entry. The config parser resolves unquantized layers to
+        # layer_config.quantized=False, but this chooser runs before that, so
+        # fall back to unquantized for any non-FP8 config whose PLE is not
+        # explicitly targeted (mirrors the CompressedTensors branch above).
+        if isinstance(quant_config, INCConfig):
             return Qwen4ExpPLEUnquantizedEmbeddingMethod()
         if not isinstance(quant_config, Fp8Config):
             raise NotImplementedError(
@@ -422,7 +459,25 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             max_total_tokens=max_total_tokens,
             data_parallel_rank=data_parallel_rank,
         )
-        self._uva_weight = get_accelerator_view_from_cpu_tensor(self.weight)
+        # [local patch] mmap/staged mode: never build the UVA view —
+        # registering the placeholder would pin the whole table in host RAM;
+        # the CPU staging path in _lookup (mmap) or the preadv gather in
+        # model_state.prepare_inputs (staged) read the rows elsewhere.
+        import os
+
+        if os.environ.get("VLLM_PLE_MMAP", "0") == "1" or os.environ.get(
+            "VLLM_PLE_STAGED", "0"
+        ) == "1":
+            self._ple_mmap = True
+            self._uva_weight = None
+            # Prefetch buffer/stream live on the active device; gathers go
+            # through the CPU-staged _lookup, which copies into `output`
+            # wherever it lives.
+            self._ple_device = torch.accelerator.current_accelerator()
+        else:
+            self._ple_mmap = False
+            self._ple_device = None
+            self._uva_weight = get_accelerator_view_from_cpu_tensor(self.weight)
         self._block_d = triton.next_power_of_2(self.embedding_dim)
         self._prefetch_stream: torch.cuda.Stream | None = None
         self._prefetch_buffer: torch.Tensor | None = None
@@ -430,6 +485,9 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         self._prefetch_rows = max_total_tokens * self.etp_data_parallel_size
         self._num_ngram_heads = num_ngram_heads
         self._output_dim = num_ngram_heads * self.embedding_dim
+        # [local patch] mmap mode: persistent pinned D2H/H2D scratch for the
+        # CPU-staged lookup (allocated lazily outside cudagraph capture).
+        self._mmap_scratch: dict[str, torch.Tensor] | None = None
 
     def allocate_embedding_weight(
         self,
@@ -437,7 +495,26 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         embedding_dim: int,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Allocate the complete PLE weight directly in pinned CPU memory."""
+        """Allocate the complete PLE weight directly in pinned CPU memory.
+
+        [local patch] With VLLM_PLE_MMAP=1 or VLLM_PLE_STAGED=1 the pinned
+        96 GiB allocation is skipped: mmap mode replaces this tensor with an
+        np.memmap-backed view before any gather runs, and staged mode never
+        reads it at all (rows come from the preadv shard reader). A
+        non-pinned placeholder holds the Parameter slot; its pages are never
+        touched.
+        """
+        import os
+
+        if os.environ.get("VLLM_PLE_MMAP", "0") == "1" or os.environ.get(
+            "VLLM_PLE_STAGED", "0"
+        ) == "1":
+            return torch.empty(
+                num_embeddings,
+                embedding_dim,
+                dtype=dtype,
+                device="cpu",
+            )
         return torch.empty(
             num_embeddings,
             embedding_dim,
@@ -470,7 +547,91 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             )
 
         flat_ids = input_ids.reshape(-1).long()
+        if _ple_debug() and not torch.cuda.is_current_stream_capturing():
+            _ple_log("lookup-in", input_ids.detach().cpu())
         if flat_ids.numel():
+            if getattr(self, "_ple_mmap", False):
+                # [local patch] mmap mode: the weight is a page-cache mmap
+                # view, not pinned RAM, so the UVA gather kernel cannot read
+                # it. Gather on the CPU (page-cache hits for hot rows) into
+                # persistent pinned staging, then copy to the GPU output.
+                # All CPU tensors are pre-allocated pinned *outside* capture
+                # (the memory profiler captures cudagraphs before any eager
+                # warmup), so no allocation or D2H staging happens mid-capture.
+                scratch = self._mmap_scratch
+                if scratch is None or scratch["rows"].shape[0] < flat_ids.numel():
+                    if torch.cuda.is_current_stream_capturing():
+                        raise RuntimeError(
+                            "PLE mmap staging must be allocated before "
+                            "cudagraph capture (run one eager forward)"
+                        )
+                    scratch = {
+                        "ids": torch.empty(
+                            flat_ids.numel(),
+                            dtype=torch.int64,
+                            device="cpu",
+                            pin_memory=True,
+                        ),
+                        "rows": torch.empty(
+                            (flat_ids.numel(), self.embedding_dim),
+                            dtype=self.weight.dtype,
+                            device="cpu",
+                            pin_memory=True,
+                        ),
+                    }
+                    self._mmap_scratch = scratch
+                n = flat_ids.numel()
+                cpu_ids = scratch["ids"][:n]
+                # Capture-safe race-free D2H: the CPU consumes cpu_ids below.
+                # Outside capture, issue an async D2H on the current stream and
+                # synchronize before touching it on the CPU — a bare
+                # non_blocking copy races the stream (under chunked-prefill
+                # pressure the CPU ran ahead and gathered rows for stale ids).
+                # During capture, the ids are dummies; zero-fill instead of
+                # touching CUDA (any sync or D2H op is illegal mid-capture).
+                if torch.cuda.is_current_stream_capturing():
+                    cpu_ids.zero_()
+                else:
+                    cpu_ids.copy_(flat_ids, non_blocking=True)
+                    torch.cuda.current_stream().synchronize()
+                start = int(self.shard_indices.org_vocab_start_index)
+                end = int(self.shard_indices.org_vocab_end_index)
+                valid = (cpu_ids >= start) & (cpu_ids < end)
+                safe_ids = cpu_ids.clamp(start, end - 1)
+                rows = scratch["rows"][:n]
+                if n:
+                    # torch.index_select on the mmap-backed weight faults
+                    # only the touched rows through the page cache.
+                    rows.copy_(
+                        torch.index_select(self.weight, 0, safe_ids),
+                        non_blocking=False,
+                    )
+                    rows *= valid.to(rows.dtype).unsqueeze(1)
+                if _os.environ.get("VLLM_PLE_ZERO", "0") == "1":
+                    # [local patch] ablation knob: zero the PLE contribution
+                    # (the CPU-staged delivery poisons the model; see notes)
+                    rows.zero_()
+                if _ple_debug():
+                    _ple_log("lookup-rows", cpu_ids, rows)
+                if output.device.type == "cuda":
+                    # The output may be a 3D prefetch buffer view
+                    # [ids, num_ngram_heads, embedding_dim]; index_select
+                    # produced [ids, embedding_dim]. Copy through a flat view
+                    # of the destination (same element count, same dtype).
+                    output.view(-1, self.embedding_dim).copy_(
+                        rows.to(output.dtype), non_blocking=True
+                    )
+                    # [local patch] the pinned scratch is reused on the next
+                    # step; async scheduling can re-enter this Python before
+                    # the GPU executes the H2D, and the next gather would
+                    # overwrite `rows` mid-copy. Wait until the copy has been
+                    # consumed (illegal mid-capture; the capture path never
+                    # reaches a live consumer of `rows`).
+                    if not torch.cuda.is_current_stream_capturing():
+                        torch.cuda.current_stream().synchronize()
+                else:
+                    output.view(-1, self.embedding_dim).copy_(rows.to(output.dtype))
+                return output
             _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
                 self._uva_weight,
                 flat_ids,
@@ -526,22 +687,34 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
                             "pinned PLE prefetch buffer must be allocated "
                             "eagerly, before cudagraph capture"
                         )
-                    self._prefetch_stream = torch.cuda.Stream(
-                        device=self._uva_weight.device
+                    # [local patch] mmap mode has no UVA weight; use the
+                    # active device captured in __init__ (CPU-staged gathers
+                    # copy into `output` wherever it lives).
+                    dev = (
+                        self._uva_weight.device
+                        if self._uva_weight is not None
+                        else self._ple_device
                     )
+                    self._prefetch_stream = torch.cuda.Stream(device=dev)
                     buffer = torch.empty(
                         self._prefetch_rows,
                         self._num_ngram_heads,
                         self.embedding_dim,
                         dtype=self.weight.dtype,
-                        device=self._uva_weight.device,
+                        device=dev,
                     )
                     self._prefetch_buffer = buffer
         prefetch_stream = self._prefetch_stream
         if prefetch_stream is None:
             raise RuntimeError("pinned PLE prefetch stream was not allocated")
         slot_size, _ = self._get_dp_gather_slot(ngram_ids.shape[0])
+        if _ple_debug() and not torch.cuda.is_current_stream_capturing():
+            _ple_log("prefetch-in", ngram_ids.detach().cpu())
         gathered_ids = self._gather_dp_ids(ngram_ids, slot_size)
+        if _ple_debug() and not torch.cuda.is_current_stream_capturing():
+            import os as _o
+            with open(_o.environ.get("VLLM_PLE_DEBUG_LOG", "/tmp/ple_debug.log"), "a") as f:
+                f.write(f"prefetch-shapes ngram={tuple(ngram_ids.shape)} gathered={tuple(gathered_ids.shape)} slot_size={slot_size} etp={self.etp_data_parallel_size} buf={tuple(buffer.shape)}\n")
         if gathered_ids.shape[0] > buffer.shape[0]:
             raise ValueError(
                 f"pinned PLE prefetch buffer holds {buffer.shape[0]} rows, "
@@ -550,7 +723,21 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         active_output = buffer[: gathered_ids.shape[0]]
         prefetch_stream.wait_stream(torch.cuda.current_stream())
         gathered_ids.record_stream(prefetch_stream)
-        with torch.cuda.stream(prefetch_stream):
+        import os as _os
+
+        if _os.environ.get("VLLM_PLE_MMAP_ASYNC", "0") == "1":
+            # [local patch] async prefetch: CPU-staged gather on the side
+            # stream. UNSAFE as written: the CPU portion of _lookup has no
+            # ordering guarantee vs. the main stream's production of the ids
+            # (record_stream pins lifetime, not readiness). Kept only for
+            # future event-fenced overlap work.
+            with torch.cuda.stream(prefetch_stream):
+                self._lookup(gathered_ids, output=active_output)
+        else:
+            # Synchronous CPU-staged gather on the MAIN stream. Correct:
+            # the D2H ids copy + sync inside _lookup orders against the
+            # producing ops, and the H2D output copy lands on the stream
+            # the consumer (_finalize_prefetch) waits on.
             self._lookup(gathered_ids, output=active_output)
 
     @eager_break_during_capture
@@ -566,6 +753,10 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         torch.cuda.current_stream().wait_stream(prefetch_stream)
         slot_size, slot_offset = self._get_dp_gather_slot(output.shape[0])
         active_output = prefetch_output[: slot_size * self.etp_data_parallel_size]
+        if _ple_debug() and not torch.cuda.is_current_stream_capturing():
+            import os as _o
+            with open(_o.environ.get("VLLM_PLE_DEBUG_LOG", "/tmp/ple_debug.log"), "a") as f:
+                f.write(f"finalize-shapes out={tuple(output.shape)} slot_size={slot_size} etp={self.etp_data_parallel_size} read_n={slot_size * self.etp_data_parallel_size}\n")
         embeddings = self._reduce_etp_embeddings(active_output)
         embeddings = self._select_embeddings(
             embeddings,
@@ -573,6 +764,8 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             slot_offset,
         )
         output.copy_(embeddings.flatten(-2))
+        if _ple_debug() and not torch.cuda.is_current_stream_capturing():
+            _ple_log("finalize-out", output.detach().cpu())
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Finish the pinned lookup into graph-owned output storage."""
